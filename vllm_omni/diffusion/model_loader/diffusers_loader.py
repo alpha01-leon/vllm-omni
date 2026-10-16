@@ -156,6 +156,27 @@ def _is_distributed_rank_zero() -> bool:
     )
 
 
+def is_checkpoint_quantized(quant_config: object) -> bool:
+    """True when the checkpoint already stores quantized weights.
+
+    Each scheme declares this under its own ``is_checkpoint_*_serialized``
+    attribute, so probe that convention rather than a single hardcoded name.
+    Treating an offline checkpoint as online-quantizable makes the loader stage
+    it on the accelerator, which both wastes device memory and, on a card that
+    is also hosting another component, exhausts it before offload hooks apply.
+    """
+    return any(
+        getattr(quant_config, name, False)
+        for name in (
+            "is_checkpoint_quantized",
+            "is_checkpoint_int8_serialized",
+            "is_checkpoint_fp8_serialized",
+            "is_checkpoint_nvfp4_serialized",
+            "is_checkpoint_mxfp4_serialized",
+        )
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class _HSDPLoadRoot:
     name: str
@@ -702,9 +723,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         offload_after_quant = False
         if load_device == "cpu" and self.quant_config is not None and device is not None:
             quant_cfg = self.quant_config
-            is_offline = getattr(quant_cfg, "data_type", None) == "mx_fp" or getattr(
-                quant_cfg, "is_checkpoint_quantized", False
-            )
+            is_offline = getattr(quant_cfg, "data_type", None) == "mx_fp" or is_checkpoint_quantized(quant_cfg)
             if not is_offline:
                 load_device = device.type
                 offload_after_quant = True
@@ -1780,7 +1799,7 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
                 rank = torch.distributed.get_rank()
 
             has_online_quant = self._has_online_quant(model) or (
-                self.quant_config is not None and not getattr(self.quant_config, "is_checkpoint_quantized", False)
+                self.quant_config is not None and not is_checkpoint_quantized(self.quant_config)
             )
             enable_broadcast = bool(getattr(self.od_config, "enable_broadcast_weight_load", False)) and world_size > 1
 

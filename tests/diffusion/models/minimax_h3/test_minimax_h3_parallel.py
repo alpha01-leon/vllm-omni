@@ -360,6 +360,10 @@ def test_local_embedding_spans_reassemble_multimodal_rows():
     model.condition_proj = _IdentityProjection()
     model.token_refiner = _IdentityRefiner()
     model.time_embedder = nn.Identity()
+    # _embed picks the time-embedding source from adaln_table, so this
+    # hand-built fixture has to declare the native (non-curve) form the same
+    # way __init__ does. Without it _embed raises AttributeError.
+    model.adaln_table = None
 
     seq_len = 16
     x = torch.arange(seq_len * 2, dtype=torch.float32).reshape(1, seq_len, 2)

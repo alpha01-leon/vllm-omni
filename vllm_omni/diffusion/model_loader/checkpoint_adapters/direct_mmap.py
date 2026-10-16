@@ -42,8 +42,12 @@ class _MiniMaxH3DirectMmapAdapter:
     ) -> DirectMmapTensorPolicy:
         del target
         transform = None
-        suffix = ".qkv_proj.weight"
-        if runtime_name.endswith(suffix):
+        # Both the fused QKV weight and its per-output-channel scale ship
+        # interleaved per head and need the identical permutation; see
+        # MiniMaxH3DiTModel.load_weights, which does the same for both.
+        for suffix in (".qkv_proj.weight_scale", ".qkv_proj.weight"):
+            if not runtime_name.endswith(suffix):
+                continue
             from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
                 MiniMaxH3Attention,
                 _reorder_grouped_qkv_to_qkv,
@@ -56,12 +60,16 @@ class _MiniMaxH3DirectMmapAdapter:
                     f"MiniMax-H3 direct-mmap adapter expected attention at {attention_path!r}, "
                     f"got {type(attention).__name__}"
                 )
+            # Must match MiniMaxH3DiTModel.load_weights: the fused QKV ships
+            # interleaved per head and has to be unpacked into the contiguous
+            # [all_q | all_k | all_v] runtime layout.
             transform = partial(
                 _reorder_grouped_qkv_to_qkv,
                 num_query_groups=attention.total_num_heads,
                 heads_per_group=1,
                 head_dim=attention.head_dim,
             )
+            break
         return DirectMmapTensorPolicy(
             allow_custom_loader=True,
             transform=transform,

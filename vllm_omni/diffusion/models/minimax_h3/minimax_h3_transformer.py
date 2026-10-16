@@ -1559,6 +1559,34 @@ class MiniMaxH3DiTModel(nn.Module):
             elif name.endswith(".attn.qkv_proj.weight"):
                 # Transform checkpoint layout before entering vLLM's loader so
                 # online FP8 can keep ``online_process_loader`` outermost.
+                #
+                # The layouts differ by artifact and this reorder is required
+                # for the ones vllm-omni actually loads:
+                #   * converted Comfy-Org int8 partitions (tools/minimax_h3/
+                #     convert_comfy_checkpoint.py) ship the fused QKV
+                #     interleaved per head, [H, 3, D], which is what this
+                #     unpacks into the contiguous [all_q | all_k | all_v] that
+                #     QKVParallelLinear shards on.
+                #   * Diffusers checkpoints carry separate attn.to_{q,k,v}
+                #     tensors and take the branch above.
+                # The native BF16 FL2VA export is already contiguous, so this
+                # is a no-op-in-name-only there -- but it is not what the
+                # server loads, and dropping the call scrambles the int8
+                # partitions that are.
+                loaded_weight = _reorder_grouped_qkv_to_qkv(
+                    loaded_weight,
+                    num_query_groups=self.arch.num_attention_heads,
+                    heads_per_group=1,
+                    head_dim=self.arch.attention_head_dim,
+                )
+                weight_loader(param, loaded_weight)
+            elif name.endswith(".attn.qkv_proj.weight_scale"):
+                # One scale per output channel, so the scale rows carry exactly
+                # the same interleaved-per-head ordering as the weight rows above.
+                # They must therefore go through the identical permutation --
+                # loading the scale block verbatim leaves it permuted against the
+                # reordered weight, which is what put block-0 QKV at cos 0.85
+                # instead of ~1.0.
                 loaded_weight = _reorder_grouped_qkv_to_qkv(
                     loaded_weight,
                     num_query_groups=self.arch.num_attention_heads,

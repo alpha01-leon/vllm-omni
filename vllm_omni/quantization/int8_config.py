@@ -474,8 +474,20 @@ class Int8LinearMethod(BaseInt8LinearMethod):
     def __init__(self, quant_config: DiffusionInt8Config):
         super().__init__(quant_config)
 
+        # ``create_weights`` registers ``weight_scale`` as a
+        # ChannelQuantScaleParameter of shape [N, 1]: one scale per output
+        # channel, which is what the offline checkpoints store (all 200
+        # quantized H3 layers ship [N, 1] fp32).
+        #
+        # Declaring the kernel per-tensor instead made it read that [N, 1]
+        # tensor as len(logical_widths) values. CUTLASS's
+        # ``convert_to_channelwise`` then rebuilt it by filling shard i from
+        # row i, discarding every row past the first, so the whole GEMM ran
+        # with the scale of channel 0/1/2 instead of the row's own. The error
+        # is a wrong magnitude rather than a scrambled layout: cos 0.876 and
+        # 2x rms on block-0 QKV, decaying to cos 0.45 on the final latents.
         self.int8_linear = init_int8_linear_kernel(
-            is_channelwise=False,
+            is_channelwise=True,
             is_static_input_scheme=False,
             input_symmetric=True,
             module_name=self.__class__.__name__,

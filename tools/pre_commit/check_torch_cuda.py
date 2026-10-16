@@ -40,6 +40,11 @@ ALLOWED_FILES = {
     "tests/diffusion/distributed/test_cfg_parallel.py",
     "tests/diffusion/distributed/test_pipeline_parallel.py",
     "tests/e2e/accuracy/wan22_i2v/run_wan22_i2v_diffusers_cp.py",
+    # int8 ComfyUI parity: both scripts query VRAM directly for run logs, and the
+    # reference side must call ComfyUI's own memory manager rather than omni's
+    # platform adapter (it is running under ComfyUI's interpreter).
+    "tests/e2e/accuracy/minimax_h3/int8_comfyui_parity/comfyui_reference.py",
+    "tests/e2e/accuracy/minimax_h3/int8_comfyui_parity/omni_multistep.py",
     "tests/e2e/features/custom_pipeline/test_async_omni_collective_rpc.py",
     "tests/e2e/features/fullduplex/test_personaplex_elastic.py",
     "tools/configure_stage_memory.py",

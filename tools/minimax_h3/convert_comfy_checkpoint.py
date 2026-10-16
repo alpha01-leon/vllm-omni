@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Convert a Comfy-Org MiniMax-H3 DiT export into a vllm-omni FL2VA partition.
 
 The ComfyUI export is fully quantized, which is the only form that fits a 20 GiB
@@ -11,10 +11,10 @@ This script undoes all three offline so the runtime keeps using the existing
 serialized-int8 path (see ``vllm_omni/quantization/int8_config.py``) with no new
 quantization scheme and no ConvRot kernel.
 
-Run it with ComfyUI's interpreter -- ``comfy_kitchen`` is a ComfyUI dependency and
-is not part of the vllm-omni dependency tree:
-
-    /data/projects/comfyui/ComfyUI/venv/bin/python convert_comfy_checkpoint.py
+It needs nothing but torch and safetensors. The ConvRot dequantization was
+transcribed from ``comfy_kitchen`` (a ComfyUI dependency, not in this repo's
+dependency tree) precisely so this tool does not require a ComfyUI checkout --
+it is a multiply and a matmul, with no private kernel involved.
 
 The text encoder is deliberately not converted: the NVFP4 weights only exist to
 shrink 63 GiB to 15 GiB on disk, and 100 of their 350 layers carry ModelOpt AWQ
@@ -87,16 +87,75 @@ def _validate_spec(spec: dict[str, Any], name: str) -> int:
     if not spec.get("convrot"):
         raise ValueError(f"{name}: expected a convrot (rotated basis) export")
     group = int(spec["convrot_groupsize"])
-    if group & (group - 1) or group < 4:
-        raise ValueError(f"{name}: convrot group size {group} is not a power of four")
+    # Power of FOUR, matching _build_hadamard's 4x4-seed recursion. A plain
+    # power-of-two check would wave through 128, which has no such Hadamard and
+    # would produce weights rotated into the wrong basis instead of erroring.
+    if group < 4 or group & (group - 1):
+        raise ValueError(f"{name}: convrot group size {group} is not a power of two")
+    remainder = group
+    while remainder % 4 == 0:
+        remainder //= 4
+    if remainder != 1:
+        raise ValueError(f"{name}: convrot group size {group} is not a power of FOUR")
     return group
 
 
-def _dequantize_convrot(q: torch.Tensor, scale: torch.Tensor, group: int) -> torch.Tensor:
-    """Undo ConvRot: dequantize per-row, then rotate back to the original basis."""
-    from comfy_kitchen.backends.eager.quantization import dequantize_int8_convrot_weight
+def _build_hadamard(size: int) -> torch.Tensor:
+    """Build the normalized REGULAR Hadamard matrix ConvRot rotates by.
 
-    return dequantize_int8_convrot_weight(q.float(), scale.float(), group)
+    Transcribed from ``comfy_kitchen.backends.eager.quantization._build_hadamard``.
+    ``size`` must be a power of FOUR, not two: the recursion below grows the
+    4x4 seed by ``torch.kron``, so 4^k is the only family it reaches. A power of
+    two outside that family (128 is the easy one to reach by accident, since
+    7168 = 128 * 56 looks like it might group that way) has no seed-compatible
+    construction, and silently accepting one would build a matrix that does not
+    undo the rotation rather than raising.
+    """
+    if size < 4 or (size & (size - 1)) != 0:
+        raise ValueError(f"ConvRot group size must be a power of two, got {size}")
+    # math.log(size, 4) % 1 is an exact-integer test for 4**k only while size is
+    # small, so use integer arithmetic instead: strip factors of 4 and see
+    # whether anything but a 1 remains.
+    remainder = size
+    while remainder % 4 == 0:
+        remainder //= 4
+    if remainder != 1:
+        raise ValueError(f"ConvRot group size must be a power of FOUR, got {size}")
+
+    h4 = torch.tensor(
+        [[1, 1, 1, -1], [1, 1, -1, 1], [1, -1, 1, 1], [-1, 1, 1, 1]],
+        dtype=torch.float32,
+    )
+    h = h4
+    current = 4
+    while current < size:
+        h = torch.kron(h, h4)
+        current *= 4
+    return h / (size**0.5)
+
+
+def _dequantize_convrot(q: torch.Tensor, scale: torch.Tensor, group: int) -> torch.Tensor:
+    """Undo ConvRot: dequantize per-row, then rotate back to the original basis.
+
+    Transcribed from ``comfy_kitchen.backends.eager.quantization``
+    ``dequantize_int8_convrot_weight``, which is ``q * scale`` followed by a
+    block-diagonal ``W @ H^T``. ``comfy_kitchen`` is a ComfyUI dependency and is
+    not in this repo's dependency tree, and it contains no private kernel -- the
+    whole thing is a multiply and a matmul -- so inlining it keeps this tool
+    runnable with nothing but torch.
+
+    Verified bit-identical to ``comfy_kitchen`` at the shapes this checkpoint
+    uses (group size 256; see ``test_convert_comfy_checkpoint.py``).
+    """
+    weight = q.float() * scale.float()
+    h = _build_hadamard(group)
+    out_f, in_f = weight.shape
+    if in_f % group != 0:
+        raise ValueError(f"in_features {in_f} not divisible by group size {group}")
+    n_groups = in_f // group
+    grouped = weight.reshape(out_f, n_groups, group)
+    rotated = torch.matmul(grouped, h.T.to(dtype=weight.dtype))
+    return rotated.reshape(out_f, in_f)
 
 
 def _requantize_int8(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

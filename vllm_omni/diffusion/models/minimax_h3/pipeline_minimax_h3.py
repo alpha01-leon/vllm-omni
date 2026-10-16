@@ -73,6 +73,7 @@ from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
 from vllm_omni.model_executor.models.minimax_h3.checkpoint import (
+    standalone_minimax_h3_partition,
     is_minimax_h3_modular,
     resolve_minimax_h3_partition,
 )
@@ -242,6 +243,10 @@ def _resolve_minimax_h3_model_root(
     if path.is_dir():
         if path.name in {"FL2VA", "Ref2VA"}:
             return path.parent
+        # A converted checkpoint puts the partition itself at the root instead
+        # of under FL2VA/; the caller re-appends that name, so peel one level.
+        if standalone_minimax_h3_partition(model) is not None:
+            return path.parent
         return path
     if is_minimax_h3_modular(model, revision):
         allow_patterns = ["modular_model_index.json", "fastvideo_inference.json", "provenance.json", "transformer/**"]
@@ -366,6 +371,10 @@ def resolve_minimax_h3_diffusion_model_path(
         return str(model_root)
     if partition == "combined":
         return str(model_root)
+    if Path(model).is_dir() and standalone_minimax_h3_partition(model) is not None:
+        # Already a partition directory; ``_resolve_minimax_h3_model_root``
+        # peeled it back to the containing root for the caller to re-join.
+        return str(model)
     subdir = "Ref2VA" if partition == "ref2va" else "FL2VA"
     return str(model_root / subdir)
 

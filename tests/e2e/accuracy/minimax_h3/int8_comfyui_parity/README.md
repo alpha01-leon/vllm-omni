@@ -28,7 +28,7 @@ residual, not a growing one**. The trajectory stays on the reference's rails.
 Three steps, because the two runners need different interpreters.
 
 ```bash
-export H3_PART=/data/models/MiniMax-H3/FL2VA_confyint8/FL2VA   # converted partition
+export H3_PART=/data/models/MiniMax-H3/FL2VA_comfyint8/FL2VA   # converted partition
 export H3_COMFY_DIT=/data/models/Comfy-Org/MiniMax-H3/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors
 export H3_TEXT_ENCODER_ROOT=/data/models/MiniMax-H3/FL2VA
 export H3_COMFY_PYTHON=/data/projects/comfyui/ComfyUI/venv/bin/python

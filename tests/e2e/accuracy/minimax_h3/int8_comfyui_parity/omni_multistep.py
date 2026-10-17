@@ -40,7 +40,7 @@ def log(*a):
     print(f"[{time.strftime('%H:%M:%S')}]", *a, flush=True)
 
 
-PART = os.environ.get("H3_PART", "/data/models/MiniMax-H3/FL2VA_confyint8/FL2VA")
+PART = os.environ.get("H3_PART", "/data/models/MiniMax-H3/FL2VA_comfyint8/FL2VA")
 CKPT = f"{PART}/transformer"
 REF = os.environ.get("H3_REF", "/tmp/h3ref/ref_ms_448x256_s8.pt")
 OUT = os.environ.get("H3_OUT", "/tmp/h3ref/omni_ms_448x256_s8.pt")

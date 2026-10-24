@@ -87,6 +87,45 @@ All three are handled in `compare.py`, with the derivation in its docstring.
    timestep, so a schedule change fails loudly instead of showing up as a fake
    divergence.
 
+## The ref2va run
+
+The same comparison for the **Ref2VA** partition, on the official material
+(the real reference video, the real voice-timbre audio, and `REF2VA_PROMPT`
+verbatim). It is a separate set of scripts because the ref2va request carries
+reference blocks, and those need their own media plumbing and their own layout
+assertions.
+
+```bash
+export H3_PART=/data/models/MiniMax-H3/Ref2VA_comfyint8/Ref2VA
+export H3_COMFY_DIT=/data/models/Comfy-Org/MiniMax-H3/diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors
+export H3_COMFY_PYTHON=/data/projects/comfyui/ComfyUI/venv/bin/python
+
+python -c "import sys; sys.path.insert(0, '.'); import ref2va_assets as A; A.write_prompt('/tmp/h3ref2va/assets/ref2va_prompt.txt')"
+H3_PROMPT=/tmp/h3ref2va/assets/ref2va_prompt.txt H3_REF_SHORT_EDGE=256 $H3_COMFY_PYTHON -I comfyui_reference_ref2va.py
+python -I omni_multistep_ref2va.py            # H3_REF / H3_OUT override the paths
+python -I compare_ref2va.py /tmp/h3ref2va/ref.pt /tmp/h3ref2va/omni.pt
+```
+
+or through pytest:
+
+```bash
+pytest tests/e2e/accuracy/minimax_h3/int8_comfyui_parity/test_int8_comfyui_parity_ref2va.py
+```
+
+Measured 2026-10-24 at 256x448, `latent_t=12`, 8 steps: the packed layout
+agrees to **7.9e-08**, and the **final latent L2rel is video 0.0267, audio
+0.0571** — the same order as, and slightly better than, the fl2va numbers.
+
+Two things the ref2va run needs that the fl2va one does not:
+
+- **The reference video has to be encoded on CPU** (~25 min at the 1344x768
+  reference canvas, which does not fit a 20 GiB card). The result is cached
+  per (VAE, frame count, canvas), so re-runs are cheap.
+- **The reference canvas is capped for the parity run.** At the production
+  768 short edge the ref2va packed sequence is ~4.8x the fl2va one and OOMs.
+  `H3_REF_SHORT_EDGE` lowers it, and *both* sides read the same value from the
+  reference payload, so the comparison stays like-for-like.
+
 ## Files
 
 | file | role |
@@ -96,6 +135,11 @@ All three are handled in `compare.py`, with the derivation in its docstring.
 | `compare.py` | scores both, prints the tables, exits non-zero past threshold |
 | `test_layout_parity.py` | pins the transcribed row-layout helpers against ComfyUI |
 | `test_int8_comfyui_parity.py` | pytest wrapper driving all three |
+| `ref2va_assets.py` | ref2va media/prompt plumbing shared by the ref2va runners |
+| `comfyui_reference_ref2va.py` | ComfyUI ref2va reference; taps the packed layout too |
+| `omni_multistep_ref2va.py` | this repo's ref2va denoise loop; taps every step |
+| `compare_ref2va.py` | scores both; also asserts the two packed layouts agree |
+| `test_int8_comfyui_parity_ref2va.py` | pytest wrapper driving the ref2va trio |
 
 `omni_multistep.py` carries transcribed copies of ComfyUI's
 patchify/unpatchify and pack/unpack_audio rather than importing them, so the

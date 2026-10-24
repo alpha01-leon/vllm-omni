@@ -1,6 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Convert a Comfy-Org MiniMax-H3 DiT export into a vllm-omni FL2VA partition.
+"""Convert a Comfy-Org MiniMax-H3 DiT export into a vllm-omni partition.
+
+Works for any partition (``FL2VA``, ``Ref2VA``, ...): the partition name is taken
+from the basename of ``--bf16-root`` and every path is a parameter. The three
+Comfy-Org int8 exports are structurally identical (932 tensors, 200 int8
+modules, same ``int8_tensorwise`` spec), so the same converter handles each.
 
 The ComfyUI export is fully quantized, which is the only form that fits a 20 GiB
 card. Nothing about it is directly loadable: the int8 weights sit in a rotated
@@ -335,8 +340,9 @@ def main() -> int:
         return 0
 
     print(f"converting {args.src} -> {args.out}")
-    # The pipeline resolves ``<model_root>/FL2VA`` for a partition directory, so
-    # --out is the model root and the partition lives one level below it.
+    # The pipeline resolves ``<model_root>/<PARTITION>`` for a partition
+    # directory, so --out is the model root and the partition lives one level
+    # below it, named after the BF16 source partition it came from.
     partition = args.out / args.bf16_root.name
     stats = convert_dit(args.src, partition / "transformer", source_config)
     print(f"  {stats}")

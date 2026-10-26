@@ -1026,8 +1026,10 @@ reduces model evaluations, but quality depends on the prompt and configuration;
 20 RES steps are a candidate to compare against an Euler-50 reference.
 
 Requests using a fixed distilled `base_schedule` from a checkpoint or adapter
-must keep `sampler="euler"`. RES sampling with those schedules has not been
-validated and is rejected with `ValueError`.
+must keep `sampler="euler"`. RES sampling on those distilled schedules has not
+been validated and is rejected with `ValueError`. On the uniform schedule
+`res_multistep` is accepted, but it has not been compared against a reference
+implementation, so `euler` remains the default.
 
 ## Request-scoped quality
 
@@ -1280,9 +1282,34 @@ request-level `scale` is a further multiplier on top of it.
 
 Every artifact except `minimax_h3_fl2v_turbo_4step_v0.1` also ships a
 `_comfyui_` export of the same weights. Those fuse Q/K/V into one projection
-and are **not** supported; downloading one is refused by name. Take the
+and are **not** served directly; downloading one is refused by name. Take the
 Diffusers file. The filename is the contract, so do not rename an artifact
 either -- a renamed file is rejected rather than served on a guess.
+
+If only a `_comfyui_` export is available, convert it into the Diffusers
+layout with `tools/minimax_h3/convert_comfy_lora.py`:
+
+```bash
+python tools/minimax_h3/convert_comfy_lora.py \
+  --src  "${TURBO_DIR}/minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors" \
+  --dst  "${TURBO_DIR}/minimax_h3_fl2v_turbo_8step_v1.0_bf16.safetensors"
+```
+
+The converter undoes the packing (splitting the fused QKV projection, putting
+the FFN halves back in `[value;gate]` order, and rewriting the module names)
+and writes the `alpha` and `key_format` metadata the server reads. It refuses
+a source whose metadata does not describe the expected fusion, rather than
+guessing.
+
+##### Combining an adapter with the int8 partition
+
+A Turbo adapter can be served on the int8 partition. The LoRA delta is
+computed in the output space (`vllm_omni/diffusion/lora/layers/base_linear.py`:
+the quantized weight GEMM runs first, then `(x @ lora_a.T) @ lora_b.T` is
+added to the result), so the adapter never has to be dequantized and the
+quantized weights are never rewritten. What the adapter does change is the
+effective scale of every adapted projection, so the accuracy of an int8 +
+adapter pairing has to be measured separately from the int8 partition's own.
 
 FL2VA artifacts serve `t2va` and `fl2va` on any FL2VA or combined server.
 Ref2VA artifacts require
@@ -1503,7 +1530,7 @@ See [FastH3 Omni — Ref2VA](../FastVideo/FastH3-Omni.md) in the
 | `duration` | Workload-specific | Decimal seconds in `extra_params`; converted to H3-compatible frame count |
 | `fps` | `24` | H3 output FPS is fixed |
 | `num_inference_steps` | `50` | Matches the reference accuracy workloads |
-| `extra_params.sampler` | `euler` | Per-request `euler` or `res_multistep` for both streams; fixed distilled schedules require Euler |
+| `extra_params.sampler` | `euler` | Per-request `euler` or `res_multistep` for both streams; fixed distilled schedules require Euler, and `res_multistep` on the uniform schedule is unvalidated against a reference |
 | `flow_shift` | `12` | Video sigma shift |
 | `audio_flow_shift` | `3` | Audio sigma shift, passed in `extra_params` |
 | `seed` | Task-specific | Use a fixed value for reproducibility |

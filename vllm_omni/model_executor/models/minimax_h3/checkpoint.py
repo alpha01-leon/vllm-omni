@@ -71,6 +71,31 @@ def is_minimax_h3_modular(model: str, revision: str | None = None) -> bool:
     return index.get("_class_name") == "MiniMaxH3ModularPipeline"
 
 
+def standalone_minimax_h3_partition(model: str) -> str | None:
+    """Name of the partition a converted checkpoint directory holds inline.
+
+    ``tools/minimax_h3/convert_comfy_checkpoint.py`` writes one self-contained
+    partition -- its own ``model_index.json``, ``transformer/`` and symlinked
+    VAEs -- under a root that is *not* named ``FL2VA``. Every other resolver
+    below keys off the root's basename, so a converted root used to resolve to
+    ``<root>/FL2VA`` and fail with "did not resolve to a registered Omni
+    pipeline". Decide from ``model_index.json`` instead, which is the same file
+    the partition format is defined by.
+    """
+    path = Path(model)
+    if not path.is_dir() or path.name in {"FL2VA", "Ref2VA"}:
+        return None
+    index_path = path / "model_index.json"
+    if not index_path.is_file():
+        return None
+    try:
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    partition = str((index.get("_minimax_h3") or {}).get("partition") or "").lower()
+    return partition or None
+
+
 def resolve_minimax_h3_partition(
     model: str,
     task_type: str | None,
@@ -86,6 +111,10 @@ def resolve_minimax_h3_partition(
     if task == "auto" and path.is_dir() and path.name in {"FL2VA", "Ref2VA"}:
         return path.name.lower()
     if task in {"auto", "combined"}:
+        if task == "auto":
+            standalone = standalone_minimax_h3_partition(model)
+            if standalone is not None:
+                return standalone
         return auto_partition
     return "ref2va" if task == "ref2va" else "fl2va"
 
@@ -117,6 +146,8 @@ def resolve_minimax_h3_encoder_model_root(
             return str(path / "text_encoder")
         if path.name in {"FL2VA", "Ref2VA"}:
             path = path.parent
+        elif standalone_minimax_h3_partition(model) is not None:
+            return str(path / "text_encoder")
         subdir = "Ref2VA" if partition == "ref2va" else "FL2VA"
         return str(path / subdir / "text_encoder")
     snapshot = download_weights_from_hf_specific(
@@ -140,4 +171,5 @@ __all__ = [
     "resolve_minimax_h3_encoder_model_root",
     "resolve_minimax_h3_model_root",
     "resolve_minimax_h3_partition",
+    "standalone_minimax_h3_partition",
 ]

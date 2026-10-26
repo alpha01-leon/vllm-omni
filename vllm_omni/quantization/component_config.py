@@ -57,12 +57,19 @@ def resolve_encoder_quant_config(
     applied to BF16 encoder weights (which lack scale tensors).  All other
     configs — including ``ComponentQuantizationConfig`` and ``None`` — are
     returned as-is so the caller can handle them.
+
+    Serialized int8 is covered by the same rule but reached differently: its
+    weight loader allocates a ``weight_scale`` per layer, so pointing it at
+    BF16 encoder weights makes startup abort on tensors the checkpoint does not
+    contain. Check the flag rather than adding ``int8`` to
+    ``PRE_QUANTIZED_METHODS``, which would also disable *online* int8 for the
+    encoder.
     """
-    if (
-        quant_config is not None
-        and not isinstance(quant_config, ComponentQuantizationConfig)
-        and quant_config.get_name() in PRE_QUANTIZED_METHODS
-    ):
+    if quant_config is None or isinstance(quant_config, ComponentQuantizationConfig):
+        return quant_config
+    if getattr(quant_config, "is_checkpoint_int8_serialized", False):
+        return None
+    if quant_config.get_name() in PRE_QUANTIZED_METHODS:
         return None
     return quant_config
 

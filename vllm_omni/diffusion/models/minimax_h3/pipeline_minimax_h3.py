@@ -76,6 +76,7 @@ from vllm_omni.model_executor.model_loader.weight_utils import (
 from vllm_omni.model_executor.models.minimax_h3.checkpoint import (
     is_minimax_h3_modular,
     resolve_minimax_h3_partition,
+    standalone_minimax_h3_partition,
 )
 from vllm_omni.model_executor.models.minimax_h3.conditioning import (
     MiniMaxH3EncoderConditioning,
@@ -249,6 +250,10 @@ def _resolve_minimax_h3_model_root(
     if path.is_dir():
         if path.name in {"FL2VA", "Ref2VA"}:
             return path.parent
+        # A converted checkpoint puts the partition itself at the root instead
+        # of under FL2VA/; the caller re-appends that name, so peel one level.
+        if standalone_minimax_h3_partition(model) is not None:
+            return path.parent
         return path
     if is_minimax_h3_modular(model, revision):
         from vllm_omni.model_executor.models.minimax_h3.checkpoint import minimax_h3_transformer_subfolder
@@ -379,6 +384,10 @@ def resolve_minimax_h3_diffusion_model_path(
         return str(model_root)
     if partition == "combined":
         return str(model_root)
+    if Path(model).is_dir() and standalone_minimax_h3_partition(model) is not None:
+        # Already a partition directory; ``_resolve_minimax_h3_model_root``
+        # peeled it back to the containing root for the caller to re-join.
+        return str(model)
     subdir = "Ref2VA" if partition == "ref2va" else "FL2VA"
     return str(model_root / subdir)
 
@@ -1928,8 +1937,9 @@ class MiniMaxH3Pipeline(
         sampler = normalize_h3_sampler(sampler)
         if sampler != "euler" and base_schedule is not None:
             raise ValueError(
-                "MiniMax H3 res_multistep sampling with a fixed distilled sigma schedule has not been validated; "
-                "use sampler='euler' for this schedule."
+                "MiniMax H3 res_multistep sampling is not validated for a fixed distilled sigma schedule; "
+                "use sampler='euler' for that schedule. res_multistep remains available on the uniform "
+                "schedule, where it has not been compared against a reference implementation."
             )
         video_sigmas = minimax_h3_time_shift_sigmas(
             num_steps=num_steps,
@@ -3152,8 +3162,9 @@ class MiniMaxH3Pipeline(
         sampler = normalize_h3_sampler(extra.get("sampler"))
         if sampler != "euler" and base_schedule is not None:
             raise ValueError(
-                "MiniMax H3 res_multistep sampling with a fixed distilled sigma schedule has not been validated; "
-                "use sampler='euler' for this schedule."
+                "MiniMax H3 res_multistep sampling is not validated for a fixed distilled sigma schedule; "
+                "use sampler='euler' for that schedule. res_multistep remains available on the uniform "
+                "schedule, where it has not been compared against a reference implementation."
             )
         transformer = getattr(
             self, "transformers_ref" if task == "ref2va" and hasattr(self, "transformers_ref") else "transformer", None

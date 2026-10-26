@@ -205,6 +205,9 @@ def test_model_load_weights_transforms_before_calling_vllm_loader():
         "blocks.0.attn.qkv_proj.weight",
         "blocks.0.mlp.fc1.weight",
     }
+    # The fused QKV ships interleaved per head, [H, 3, D]; load_weights unpacks it
+    # into the contiguous [all_q | all_k | all_v] that QKVParallelLinear shards
+    # on. Dropping that unpack scrambles the int8 partitions vllm-omni loads.
     assert qkv_calls[0][:, 0].tolist() == [0, 3, 1, 4, 2, 5]
     assert [(shard_id, tensor[:, 0].tolist()) for shard_id, tensor in fc1_calls] == [
         (0, [0, 1]),
@@ -275,3 +278,98 @@ def test_pipeline_resolves_transformer_component_quant_config():
     assert transformer_config.ignored_layers == ignored_layers
     assert _resolve_component_quant_config(component_config, "transformer") is transformer_config
     assert _resolve_component_quant_config(transformer_config, "transformer") is transformer_config
+
+
+def test_model_load_weights_reorders_qkv_scale_with_the_same_permutation():
+    """The per-output-channel QKV scale ships in the same interleaved row order
+    as the weight, so it has to take the same unpack.
+
+    Loading it verbatim leaves it permuted against the reordered weight. The
+    block-0 QKV GEMM then runs at cos 0.85 against the reference, which decays
+    to cos 0.9993 -> 0.45 on the final latents.
+    """
+    from vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer import (
+        MiniMaxH3DiTArchConfig,
+        MiniMaxH3DiTModel,
+    )
+
+    qkv_calls = []
+    scale_calls = []
+
+    def qkv_loader(param, loaded_weight):
+        del param
+        qkv_calls.append(loaded_weight.clone())
+
+    def scale_loader(param, loaded_weight):
+        del param
+        scale_calls.append(loaded_weight.clone())
+
+    model = object.__new__(MiniMaxH3DiTModel)
+    nn.Module.__init__(model)
+    model.arch = MiniMaxH3DiTArchConfig(
+        hidden_size=1,
+        num_attention_heads=2,
+        attention_head_dim=1,
+        ffn_hidden_size=2,
+    )
+    model.blocks = nn.ModuleList([nn.Module()])
+    class _FusedQKV(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.empty(1))
+            self.weight.weight_loader = qkv_loader
+            self.weight_scale = nn.Parameter(torch.empty(1))
+            self.weight_scale.weight_loader = scale_loader
+
+    model.blocks[0].attn = nn.Module()
+    model.blocks[0].attn.qkv_proj = _FusedQKV()
+
+    rows = torch.arange(6, dtype=torch.float32)
+    loaded = model.load_weights(
+        [
+            ("blocks.0.attn.qkv_proj.weight", rows.reshape(6, 1)),
+            ("blocks.0.attn.qkv_proj.weight_scale", rows.reshape(6, 1)),
+        ]
+    )
+
+    assert loaded == {
+        "blocks.0.attn.qkv_proj.weight",
+        "blocks.0.attn.qkv_proj.weight_scale",
+    }
+    # Same permutation as the weight, not the identity.
+    assert scale_calls[0][:, 0].tolist() == qkv_calls[0][:, 0].tolist() == [0, 3, 1, 4, 2, 5]
+
+
+def test_loader_adapter_reorders_direct_mmap_qkv_scale_too(monkeypatch):
+    """The direct-mmap adapter serves the real server load path, so the scale
+    needs the same transform it already gives the weight."""
+    from vllm_omni.diffusion.model_loader.checkpoint_adapters import (
+        get_direct_mmap_adapter,
+    )
+    from vllm_omni.diffusion.models.minimax_h3 import minimax_h3_transformer as h3
+
+    monkeypatch.setattr(h3, "QKVParallelLinear", _FakeLinear)
+    monkeypatch.setattr(h3, "RowParallelLinear", _FakeLinear)
+    monkeypatch.setattr(h3, "Attention", _FakeAttention)
+
+    arch = h3.MiniMaxH3DiTArchConfig(
+        hidden_size=1,
+        num_attention_heads=2,
+        attention_head_dim=1,
+        rope_inv_freq_len=1,
+    )
+    attention = h3.MiniMaxH3Attention(arch, quant_config=None, prefix="blocks.0.attn")
+    transformer = object.__new__(h3.MiniMaxH3DiTModel)
+    nn.Module.__init__(transformer)
+    transformer.blocks = nn.ModuleList([nn.Module()])
+    transformer.blocks[0].attn = attention
+    pipeline = nn.Module()
+    pipeline.transformer = transformer
+
+    adapter = get_direct_mmap_adapter(pipeline)
+    checkpoint = torch.arange(6, dtype=torch.float32).reshape(6, 1)
+    weight_policy = adapter.policy_for("transformer.blocks.0.attn.qkv_proj.weight", attention.qkv_proj.weight)
+    scale_policy = adapter.policy_for("transformer.blocks.0.attn.qkv_proj.weight_scale", None)
+
+    assert scale_policy.transform is not None
+    assert scale_policy.transform(checkpoint)[:, 0].tolist() == weight_policy.transform(checkpoint)[:, 0].tolist()

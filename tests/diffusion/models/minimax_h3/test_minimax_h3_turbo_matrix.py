@@ -109,3 +109,57 @@ def test_task_family_decides_supported_tasks() -> None:
     ref2v = _spec("minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16.safetensors")
     assert fl2v.supported_tasks == frozenset({"t2va", "fl2va"})
     assert ref2v.supported_tasks == frozenset({"ref2va"})
+
+
+# Sigmas ComfyUI's own KSampler printed for the FL2VA checkpoint
+# (comfy.supported_models.MiniMaxH3.sampling_settings: shift 12.0, audio_shift
+# 3.0) at eight euler steps. They come from ComfyUI's "simple" scheduler, which
+# resamples ``ModelSamplingDiscrete.sigmas`` -- an array whose top is already
+# 14.6146, not 1.0 -- so it agrees with our grid only because the H3 shift
+# re-derives the base positions from the shifted sigma. If the shift formula or
+# its bounds ever change, this diverges; that is the point of pinning it.
+COMFYUI_FLV2A_EIGHT_STEP_SIGMAS = [
+    1.0,
+    0.9882,
+    0.9730,
+    0.9524,
+    0.9231,
+    0.8780,
+    0.8000,
+    0.6316,
+    0.0,
+]
+
+
+@pytest.mark.parametrize("steps", [4, 8, 50])
+def test_video_schedule_reproduces_comfyui_ksampler_output(steps: int) -> None:
+    from vllm_omni.diffusion.models.minimax_h3.time_request import minimax_h3_time_shift_sigmas
+
+    sigmas = minimax_h3_time_shift_sigmas(num_steps=steps, shift_scale=12.0)
+    assert len(sigmas) == steps + 1
+    assert sigmas[0] == pytest.approx(1.0, abs=1e-7)
+    assert sigmas[-1] == pytest.approx(0.0, abs=1e-7)
+    assert sigmas == sorted(sigmas, reverse=True)
+    if steps == 8:
+        assert sigmas == pytest.approx(COMFYUI_FLV2A_EIGHT_STEP_SIGMAS, abs=5e-4)
+
+
+def test_audio_schedule_is_the_same_grid_at_a_lower_shift() -> None:
+    """H3 carries audio as ``(sigma_video / sigma_audio) * x`` at shift 3.0."""
+    from vllm_omni.diffusion.models.minimax_h3.time_request import minimax_h3_time_shift_sigmas
+
+    video = minimax_h3_time_shift_sigmas(num_steps=8, shift_scale=12.0)
+    audio = minimax_h3_time_shift_sigmas(num_steps=8, shift_scale=3.0)
+    # Both traverse the same endpoints at different curvature. A larger shift
+    # keeps the grid nearer sigma=1 for longer, so video stays strictly above
+    # audio at every interior point.
+    assert (video[0], video[-1]) == (audio[0], audio[-1]) == (1.0, 0.0)
+    assert all(v > a for v, a in zip(video[1:-1], audio[1:-1]))
+
+
+def test_explicit_base_schedule_takes_precedence_over_the_step_count() -> None:
+    """Distilled checkpoints pin a non-uniform few-step grid."""
+    from vllm_omni.diffusion.models.minimax_h3.time_request import minimax_h3_time_shift_sigmas
+
+    pinned = minimax_h3_time_shift_sigmas(num_steps=50, shift_scale=12.0, base_schedule=[1.0, 0.5, 0.0])
+    assert pinned == pytest.approx([1.0, 12 * 0.5 / (1 + 11 * 0.5), 0.0], abs=1e-7)

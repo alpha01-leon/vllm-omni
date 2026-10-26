@@ -31,6 +31,8 @@ from vllm_omni.lora.request import LoRARequest
 from vllm_omni.model_executor.models.minimax_h3.checkpoint import (
     is_minimax_h3_modular,
     resolve_minimax_h3_model_root,
+    resolve_minimax_h3_partition,
+    standalone_minimax_h3_partition,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -409,6 +411,38 @@ def test_native_hub_model_with_modular_class_keeps_partition_layout(monkeypatch)
     )
 
     assert checkpoint_module.is_minimax_h3_modular("MiniMaxAI/MiniMax-H3") is False
+
+
+def test_converted_partition_root_resolves_without_an_FL2VA_subdir(tmp_path):
+    """A converted checkpoint holds its partition inline, not under FL2VA/.
+
+    ``convert_comfy_checkpoint.py`` writes ``<out>/FL2VA/``, but nothing in the
+    format requires that name -- and a root named anything else used to resolve
+    to ``<root>/FL2VA`` and fail to register at all.
+    """
+    root = tmp_path / "MiniMax-H3-int8"
+    (root / "transformer").mkdir(parents=True)
+    (root / "text_encoder").mkdir()
+    (root / "model_index.json").write_text(
+        json.dumps({"_class_name": "MiniMaxH3Pipeline", "_minimax_h3": {"partition": "fl2va"}}),
+        encoding="utf-8",
+    )
+
+    assert standalone_minimax_h3_partition(str(root)) == "fl2va"
+    assert resolve_minimax_h3_partition(str(root), None, auto_partition="combined") == "fl2va"
+    assert resolve_minimax_h3_model_root(str(root), None, "fl2va") == str(root / "text_encoder")
+    assert resolve_minimax_h3_diffusion_model_path(str(root), None, None) == str(root)
+
+
+def test_root_without_a_partition_marker_keeps_the_existing_layout(tmp_path):
+    """A plain hub-style root must not start claiming to be standalone."""
+    root = tmp_path / "MiniMax-H3"
+    (root / "FL2VA" / "text_encoder").mkdir(parents=True)
+
+    assert standalone_minimax_h3_partition(str(root)) is None
+    assert resolve_minimax_h3_partition(str(root), None, auto_partition="combined") == "combined"
+    assert resolve_minimax_h3_model_root(str(root), None, "fl2va") == str(root / "FL2VA" / "text_encoder")
+    assert resolve_minimax_h3_diffusion_model_path(str(root), None, None) == str(root / "FL2VA")
 
 
 def test_native_local_model_root_keeps_partition_layout(tmp_path):

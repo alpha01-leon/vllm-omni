@@ -234,6 +234,11 @@ class MiniMaxH3DiTArchConfig:
     timestep_input_dim: int = 256
     time_embed_hidden_size: int = 5376
     time_embed_dim: int = 2688
+    # Curve-form AdaLN exports (Comfy-Org) replace ``time_embedder`` with a
+    # precomputed ``[rows, time_embed_dim]`` lookup table, collapsing every
+    # ``adaln_proj`` input dim from 2688 to 8 and skipping the SiLU. Zero means
+    # the native ``time_embedder`` form; a positive value is the curve width.
+    adaln_table_dim: int = 0
     adaln_out_features: int = 18 * 5376
     final_adaln_out_features: int = 2 * 5376
     rope_inv_freq_len: int = 16
@@ -263,6 +268,8 @@ class MiniMaxH3DiTArchConfig:
         arch = cls(**values)
         if len(arch.patch_size) != 3:
             raise ValueError(f"patch_size must contain three values, got {arch.patch_size!r}")
+        if arch.adaln_table_dim < 0:
+            raise ValueError(f"adaln_table_dim must be non-negative, got {arch.adaln_table_dim}")
         return arch
 
 
@@ -287,7 +294,12 @@ MINIMAX_H3_FP32_PARAM_NAMES = frozenset(
     }
 )
 MINIMAX_H3_FP32_BUFFER_NAMES = frozenset(
-    {"rope.inv_freq", "final_layer.video_out.coefficients", "final_layer.audio_out.coefficients"}
+    {
+        "rope.inv_freq",
+        "adaln_t_table",
+        "final_layer.video_out.coefficients",
+        "final_layer.audio_out.coefficients",
+    }
 )
 
 # AdaLN modality count: token tags carry -1 for padding and 0/1/2 for
@@ -500,6 +512,42 @@ class MiniMaxH3TimeEmbedder(nn.Module):
         hidden = nn.functional.silu(hidden)
         out, _ = self.proj_out(hidden)
         return out
+
+
+class MiniMaxH3AdalnTable(nn.Module):
+    """Curve-form AdaLN: lookup a precomputed time-embedding curve instead.
+
+    Comfy-Org exports ship a ``[rows, width]`` ``adaln_t_table`` buffer in place
+    of the ``time_embedder`` MLP, and every ``adaln_proj`` consumes its columns
+    directly -- no SiLU, and an input dim of ``width`` rather than 2688. The two
+    forms are not interchangeable: the native path feeds
+    ``silu(time_embedder(t))`` whose 8-dimensional span differs from the table's
+    (cosine similarity 0.095), so this path must stay a distinct module rather
+    than a reinterpretation of the embedder's output.
+
+    The buffer lives on the DiT rather than here, registered under the
+    checkpoint's own ``adaln_t_table`` key. Owning it here would surface it as
+    ``adaln_t_table.adaln_t_table``, which no checkpoint key matches, so the
+    loader would drop it and every lookup would fail.
+
+    Lookup mirrors ``comfy/ldm/minimax/model.py``: clamp ``t`` to ``[0, 1]``,
+    scale to row space, and linearly interpolate between adjacent rows.
+    """
+
+    def __init__(self, width: int) -> None:
+        super().__init__()
+        self.width = width
+
+    def forward(self, t: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+        """t: [M] in [0, 1] -> [M, width] fp32, linearly interpolated."""
+        if table.ndim != 2 or table.shape[0] < 2:
+            raise ValueError(
+                "MiniMax-H3 curve-form AdaLN requires a 2-D adaln_t_table with at "
+                f"least 2 rows, got {tuple(table.shape)}"
+            )
+        pos = t.to(_FP32_DTYPE).clamp(0.0, 1.0) * (table.shape[0] - 1)
+        i0 = pos.floor().long().clamp(max=table.shape[0] - 2)
+        return torch.lerp(table[i0], table[i0 + 1], (pos - i0).unsqueeze(1))
 
 
 def _sdpa_varlen_attention(
@@ -975,11 +1023,15 @@ class MiniMaxH3AdalnProj(nn.Module):
         self.expand_ratio = expand_ratio
         self.modality_num = modality_num
         self.hidden_size = arch.hidden_size
+        # Curve-form AdaLN collapses the input dim to the table width and
+        # consumes its columns directly, bypassing the SiLU.
+        self.apply_silu = arch.adaln_table_dim == 0
+        in_features = arch.adaln_table_dim or arch.time_embed_dim
         # Allocate host weights from the start: moving them after construction
         # would still require enough VRAM for the complete resident model.
         with torch.device("cpu") if self._offload_weights else nullcontext():
             self.linear = ColumnParallelLinear(
-                arch.time_embed_dim,
+                in_features,
                 out_features,
                 bias=True,
                 gather_output=True,
@@ -1036,7 +1088,8 @@ class MiniMaxH3AdalnProj(nn.Module):
         self._prepare_weight_stager(t_emb.device)
 
         def project() -> torch.Tensor:
-            x = nn.functional.silu(t_emb)
+            # Curve form: the table already is the embedding, so no SiLU.
+            x = t_emb if not self.apply_silu else nn.functional.silu(t_emb)
             if self._weight_stager is None:
                 return self.linear(x.to(_BF16_DTYPE))[0]
             self._weight_stager.load()
@@ -1489,6 +1542,16 @@ class MiniMaxH3DiTModel(nn.Module):
         )
         if type(enabled) is not bool:
             raise ValueError("minimax_h3_adaln_cache must be a boolean")
+        if enabled and arch.adaln_table_dim:
+            # The prebuilt cache is keyed on the time_embedder MLP weights and
+            # replays `silu(embedder(t))` per step. Curve-form checkpoints have
+            # no embedder and no SiLU, so the cache cannot be built or bound.
+            logger.info(
+                "MiniMax H3 curve-form AdaLN detected (adaln_table_dim=%d); "
+                "disabling the prebuilt adaln_cache, which requires time_embedder weights",
+                arch.adaln_table_dim,
+            )
+            enabled = False
         offload = resolve_offload(od_config)
         conflicting_offload = (
             offload.strategy is not OffloadStrategy.NONE and offload.offloads(DIT_COMPONENT)
@@ -1575,10 +1638,25 @@ class MiniMaxH3DiTModel(nn.Module):
             quant_config=quant_config,
             prefix="condition_proj",
         )
-        self.time_embedder = MiniMaxH3TimeEmbedder(
-            arch,
-            prefix="time_embedder",
-        )
+        # Curve-form checkpoints carry `adaln_t_table` instead of a
+        # `time_embedder` MLP. Only build the module the checkpoint declares,
+        # so an unexpected mix fails loudly instead of silently ignoring one.
+        if arch.adaln_table_dim:
+            self.adaln_table = MiniMaxH3AdalnTable(arch.adaln_table_dim)
+            # The buffer keeps the checkpoint's own key so ``load_weights``
+            # matches it. It cannot live on ``self.adaln_table`` (it would
+            # surface as ``adaln_table.adaln_t_table``) and the module and
+            # buffer cannot share one attribute name, hence the two names.
+            self.register_buffer(
+                "adaln_t_table", torch.zeros(0, arch.adaln_table_dim, dtype=_FP32_DTYPE), persistent=True
+            )
+            self.time_embedder = None
+        else:
+            self.adaln_table = None
+            self.time_embedder = MiniMaxH3TimeEmbedder(
+                arch,
+                prefix="time_embedder",
+            )
         self.rope = MiniMaxH3Rope(arch.rope_inv_freq_len)
         self.token_refiner = MiniMaxH3TokenRefiner(
             arch,
@@ -1771,6 +1849,27 @@ class MiniMaxH3DiTModel(nn.Module):
                 logger.warning("Skipping MiniMax H3 weight not present in model: %s", name)
                 continue
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
+            if name == "adaln_t_table":
+                # Curve form: the table width must match what every adaln_proj
+                # was built for, otherwise the projections silently mismatch.
+                # The row count is checkpoint-specific, so only the width is
+                # required to agree with the arch config.
+                if loaded_weight.ndim != 2 or loaded_weight.shape[1] != self.arch.adaln_table_dim:
+                    raise ValueError(
+                        "adaln_t_table width does not match the arch's adaln_table_dim: "
+                        f"{tuple(loaded_weight.shape)} vs {self.arch.adaln_table_dim}"
+                    )
+                if loaded_weight.shape[0] < 2:
+                    raise ValueError(f"adaln_t_table needs at least 2 rows, got {loaded_weight.shape[0]}")
+                if loaded_weight.dtype != _FP32_DTYPE:
+                    raise ValueError(f"adaln_t_table must be fp32, got {loaded_weight.dtype}")
+                # The registered buffer is a row-count placeholder, and
+                # ``default_weight_loader`` needs an exact pre-existing size.
+                # Re-register so the real table becomes the buffer the forward
+                # pass reads.
+                self.register_buffer("adaln_t_table", loaded_weight.detach().clone(), persistent=True)
+                loaded.add(name)
+                continue
             if layout in {"q", "k", "v"}:
                 # vLLM can load each projection directly into its packed QKV
                 # parameter, including TP slicing and online quantization.
@@ -1779,6 +1878,34 @@ class MiniMaxH3DiTModel(nn.Module):
             elif name.endswith(".attn.qkv_proj.weight"):
                 # Transform checkpoint layout before entering vLLM's loader so
                 # online FP8 can keep ``online_process_loader`` outermost.
+                #
+                # The layouts differ by artifact and this reorder is required
+                # for the ones vllm-omni actually loads:
+                #   * converted Comfy-Org int8 partitions (tools/minimax_h3/
+                #     convert_comfy_checkpoint.py) ship the fused QKV
+                #     interleaved per head, [H, 3, D], which is what this
+                #     unpacks into the contiguous [all_q | all_k | all_v] that
+                #     QKVParallelLinear shards on.
+                #   * Diffusers checkpoints carry separate attn.to_{q,k,v}
+                #     tensors and take the branch above.
+                # The native BF16 FL2VA export is already contiguous, so this
+                # is a no-op-in-name-only there -- but it is not what the
+                # server loads, and dropping the call scrambles the int8
+                # partitions that are.
+                loaded_weight = _reorder_grouped_qkv_to_qkv(
+                    loaded_weight,
+                    num_query_groups=self.arch.num_attention_heads,
+                    heads_per_group=1,
+                    head_dim=self.arch.attention_head_dim,
+                )
+                weight_loader(param, loaded_weight)
+            elif name.endswith(".attn.qkv_proj.weight_scale"):
+                # One scale per output channel, so the scale rows carry exactly
+                # the same interleaved-per-head ordering as the weight rows above.
+                # They must therefore go through the identical permutation --
+                # loading the scale block verbatim leaves it permuted against the
+                # reordered weight, which is what put block-0 QKV at cos 0.85
+                # instead of ~1.0.
                 loaded_weight = _reorder_grouped_qkv_to_qkv(
                     loaded_weight,
                     num_query_groups=self.arch.num_attention_heads,
@@ -1964,7 +2091,11 @@ class MiniMaxH3DiTModel(nn.Module):
             audio_embed.to(_BF16_DTYPE)[: audio_local_pos.shape[0]],
         )
 
-        t_emb = self.time_embedder(unique_timesteps)
+        t_emb = (
+            self.adaln_table(unique_timesteps, self.adaln_t_table)
+            if self.adaln_table is not None
+            else self.time_embedder(unique_timesteps)
+        )
         return embeddings, t_emb
 
     def create_reference_kv_state(

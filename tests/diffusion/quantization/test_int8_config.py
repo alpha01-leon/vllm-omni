@@ -415,7 +415,7 @@ class TestInt8LinearMethod:
 
         assert method.quant_config == mock_quant_config
         init_int8_linear_kernel.assert_called_once_with(
-            is_channelwise=False, is_static_input_scheme=False, input_symmetric=True, module_name="Int8LinearMethod"
+            is_channelwise=True, is_static_input_scheme=False, input_symmetric=True, module_name="Int8LinearMethod"
         )
         assert method.int8_linear == patch_deps
 
